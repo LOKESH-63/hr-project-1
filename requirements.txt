@@ -1,8 +1,9 @@
-fastapi
-uvicorn
 gradio
 faiss-cpu
-sentence-transformers
+numpy
+openai
+langchain-community
+langchain-text-splitters
 pypdf
-transformers
-torch
+python-dotenv
+
