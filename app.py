@@ -1,114 +1,94 @@
-import faiss
 import gradio as gr
+import faiss
 import numpy as np
+import os
+import re
+from dotenv import load_dotenv
+from openai import OpenAI
 
-from fastapi import FastAPI
-from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer
-from transformers import pipeline
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# ================= CONFIG =================
-PDF_PATH = "hr_policy.pdf"
-TOP_K = 8
-SIMILARITY_THRESHOLD = 0.35
+# ---------------- LOAD ENV ----------------
+load_dotenv()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# ================= LOAD MODELS =================
-embedder = SentenceTransformer("BAAI/bge-base-en-v1.5")
+# ---------------- CLEAN POLICY TEXT ----------------
+def clean_policy_text(text):
+    text = re.sub(r"\b\d+(\.\d+)+\b", "", text)
+    text = re.sub(r"^\s*\d+\s*", "", text, flags=re.MULTILINE)
+    return text.strip()
 
-llm = pipeline(
-    "text2text-generation",
-    model="google/flan-t5-base",
-    max_length=256
-)
+# ---------------- EMBEDDING FUNCTION ----------------
+def get_embedding(text):
+    response = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=text
+    )
+    return np.array(response.data[0].embedding, dtype="float32")
 
-# ================= LOAD & CLEAN PDF =================
-def load_pdf_text(path):
-    reader = PdfReader(path)
-    text = ""
-    for page in reader.pages:
-        page_text = page.extract_text()
-        if page_text:
-            text += page_text.replace("\n", " ") + " "
-    return text
+# ---------------- LOAD PDF + BUILD INDEX ----------------
+def load_rag_pipeline():
+    loader = PyPDFLoader("Sample_HR_Policy_Document.pdf")
+    docs = loader.load()
 
-raw_text = load_pdf_text(PDF_PATH)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+    chunks = splitter.split_documents(docs)
 
-# ================= CHUNKING =================
-def chunk_text(text, size=750, overlap=120):
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + size
-        chunks.append(text[start:end])
-        start += size - overlap
-    return chunks
+    texts = [c.page_content for c in chunks]
+    embeddings = np.vstack([get_embedding(t) for t in texts])
 
-chunks = chunk_text(raw_text)
+    index = faiss.IndexFlatL2(embeddings.shape[1])
+    index.add(embeddings)
 
-# ================= EMBEDDINGS + FAISS =================
-embeddings = embedder.encode(chunks)
-dimension = embeddings.shape[1]
+    return index, texts
 
-index = faiss.IndexFlatL2(dimension)
-index.add(np.array(embeddings))
+index, texts = load_rag_pipeline()
 
-# ================= HR PROMPT =================
-PROMPT = """
-You are a professional HR Policy Assistant.
+# ---------------- CHAT FUNCTION ----------------
+def hr_chatbot(question, history):
+    q_emb = get_embedding(question)
+    _, idx = index.search(np.array([q_emb]), k=3)
 
-Answer ONLY using the policy context below.
-Rewrite the answer in your own words.
-Use polite, professional HR language.
-Do not quote the policy text.
-Do not guess.
+    raw_context = texts[idx[0][0]]
+    context = clean_policy_text(raw_context)
 
-If the answer is not found, say:
-"I checked the HR policy document, but this information is not mentioned. Please contact the HR team for further clarification."
+    prompt = f"""
+You are a professional HR assistant.
 
-Policy Context:
+Rules:
+- Answer ONLY from policy content
+- Give a short, natural summary (2–3 sentences)
+- Do NOT include clause numbers
+- Do NOT assume information
+
+If not available, reply exactly:
+"I checked the HR policy document, but this information is not mentioned."
+
+Policy Content:
 {context}
 
-Employee Question:
+Question:
 {question}
+
+Final Answer:
 """
 
-# ================= QA FUNCTION =================
-def get_answer(question):
-    q_emb = embedder.encode([question])
-    distances, indices = index.search(q_emb, TOP_K)
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        max_tokens=120
+    )
 
-    if distances[0][0] > SIMILARITY_THRESHOLD:
-        return (
-            "I checked the HR policy document, but this information is not mentioned. "
-            "Please contact the HR team for further clarification."
-        )
+    return response.choices[0].message.content.strip()
 
-    context = " ".join([chunks[i] for i in indices[0][:3]])
-    prompt = PROMPT.format(context=context, question=question)
-
-    response = llm(prompt)[0]["generated_text"]
-    return response.strip()
-
-# ================= FASTAPI =================
-api = FastAPI()
-
-@api.get("/ask")
-def ask(q: str):
-    return {"answer": get_answer(q)}
-
-# ================= GRADIO UI =================
-def chat(message, history):
-    answer = get_answer(message)
-    history.append((message, answer))
-    return history, history
-
-with gr.Blocks(title="HR Policy Assistant") as demo:
-    gr.Markdown("## 🏢 HR Policy Assistant")
-    chatbot = gr.Chatbot()
-    msg = gr.Textbox(placeholder="Ask your HR question...")
-    state = gr.State([])
-
-    msg.submit(chat, [msg, state], [chatbot, state])
-    msg.submit(lambda: "", None, msg)
+# ---------------- GRADIO UI ----------------
+demo = gr.ChatInterface(
+    fn=hr_chatbot,
+    title="🏢 HR Policy Assistant",
+    description="Ask questions about company HR policies",
+    theme="soft"
+)
 
 demo.launch()
